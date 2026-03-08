@@ -5,7 +5,7 @@ project(Vulkan_XPBD_TetraSim)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(SOURCES 
-    Vulkan_XPBD_TetraSim.cpp
+    src/Vulkan_XPBD_TetraSim.cpp
 )
 include(FetchContent)
 
