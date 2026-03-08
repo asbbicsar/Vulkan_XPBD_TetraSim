@@ -7,6 +7,8 @@
 
 #include <iostream>
 #include <fstream>
+#include <sstream>
+#include <string>
 #include <stdexcept>
 #include <algorithm>
 #include <chrono>
@@ -70,21 +72,40 @@ struct SwapChainSupportDetails {
     std::vector<VkPresentModeKHR> presentModes;
 };
 
-struct SphereNode {
+struct UniformBufferObject {
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
+};
+
+struct MeshPushConstants {
+    float dt;
+    float u_Time;
+    int subStepCnt;
+    int iteration;
+    int constraintOffset;
+    int constraintCount;
+    float padding[2];
+};
+
+
+struct Particle {
     glm::vec4 pos;
     glm::vec4 color;
 
-    glm::vec4 prevPos;
+    glm::vec4 vel;
     glm::vec4 originPos;
+    glm::vec4 prevPos;
     glm::vec4 normal;
+    float invMass;
     float isFixed;
-	float isSurface;
-    float _padding[2];
+    float isSurface;
+    float padding;
 
     static VkVertexInputBindingDescription getBindingDescription() {
         VkVertexInputBindingDescription bindingDescription{};
         bindingDescription.binding = 0;
-        bindingDescription.stride = sizeof(SphereNode);
+        bindingDescription.stride = sizeof(Particle);
         bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
         return bindingDescription;
@@ -96,153 +117,355 @@ struct SphereNode {
         attributeDescriptions[0].binding = 0;
         attributeDescriptions[0].location = 0;
         attributeDescriptions[0].format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        attributeDescriptions[0].offset = offsetof(SphereNode, pos);
+        attributeDescriptions[0].offset = offsetof(Particle, pos);
 
         attributeDescriptions[1].binding = 0;
         attributeDescriptions[1].location = 1;
         attributeDescriptions[1].format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        attributeDescriptions[1].offset = offsetof(SphereNode, color);
-
-        //attributeDescriptions[2].binding = 0;
-        //attributeDescriptions[2].location = 2;
-        //attributeDescriptions[2].format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        //attributeDescriptions[2].offset = offsetof(SphereNode, prevPos);
-        //
-        //attributeDescriptions[3].binding = 0;
-        //attributeDescriptions[3].location = 3;
-        //attributeDescriptions[3].format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        //attributeDescriptions[3].offset = offsetof(SphereNode, normal);
-        //
-        //attributeDescriptions[4].binding = 0;
-        //attributeDescriptions[4].location = 4;
-        //attributeDescriptions[4].format = VK_FORMAT_R32_SFLOAT;
-        //attributeDescriptions[4].offset = offsetof(SphereNode, isFixed);
-        //
-        //attributeDescriptions[4].binding = 0;
-        //attributeDescriptions[4].location = 5;
-        //attributeDescriptions[4].format = VK_FORMAT_R32_SFLOAT;
-        //attributeDescriptions[4].offset = offsetof(SphereNode, isSurface);
+        attributeDescriptions[1].offset = offsetof(Particle, color);
 
         return attributeDescriptions;
     }
 };
 
-struct UniformBufferObject {
-    alignas(16) glm::mat4 model;
-    alignas(16) glm::mat4 view;
-    alignas(16) glm::mat4 proj;
+struct Edge {
+    uint32_t indices[2];
+    int32_t marker;
+    int32_t padding;
 };
 
-struct MeshPushConstants {
-    float dt;
-    float u_Time;
+struct Tetrahedron {
+    uint32_t indices[4];
 };
 
-static std::vector<SphereNode> generateSphereNodes(uint32_t width, uint32_t height, uint32_t depth, float spacing) {
-    std::vector<SphereNode> nodes;
-    nodes.reserve(width * height * depth);
+struct Face {
+    uint32_t indices[3];
+    int32_t marker;
+};
 
-    for (uint32_t z = 0; z < depth; z++) {
-        for (uint32_t y = 0; y < height; y++) {
-            for (uint32_t x = 0; x < width; x++) {
-                SphereNode node{};
+struct DistanceConstraint {
+    uint32_t p1, p2;
+    float restLen;
+    float compliance;
+    float lambda;
+    float padding[3];
+};
 
-                // 1. [-1, 1] 범위의 정규화된 좌표(Normalized Device Coordinates)로 변환
-                float nx = (x / (float)(width - 1)) * 2.0f - 1.0f;
-                float ny = (y / (float)(height - 1)) * 2.0f - 1.0f;
-                float nz = (z / (float)(depth - 1)) * 2.0f - 1.0f;
+struct VolumeConstraint {
+    uint32_t p1, p2, p3, p4;
+    float restVol;
+    float compliance;
+    float lambda;
+    float padding;
+};
 
-                // 2. Spherified Cube 공식 적용 (정육면체 격자를 구 형태로 왜곡)
-                // 이 공식은 모서리 부분의 왜곡을 최소화하며 균일한 밀도를 제공합니다.
-                float sx = nx * sqrt(1.0f - (ny * ny / 2.0f) - (nz * nz / 2.0f) + (ny * ny * nz * nz / 3.0f));
-                float sy = ny * sqrt(1.0f - (nz * nz / 2.0f) - (nx * nx / 2.0f) + (nz * nz * nx * nx / 3.0f));
-                float sz = nz * sqrt(1.0f - (nx * nx / 2.0f) - (ny * ny / 2.0f) + (nx * nx * ny * ny / 3.0f));
+bool getValidLine(std::ifstream& file, std::string& line) {
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
 
-                // 3. 반지름 및 중심점 적용
-                //glm::vec3 finalPos = glm::vec3(sx, sy, sz) * radius + center;
-                glm::vec3 finalPos = glm::vec3(sx, sy, sz);
+        size_t first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        if (line[first] == '#') continue;
 
-                node.pos = glm::vec4(finalPos, 1.0f);
-                node.prevPos = node.pos;
-				node.originPos = node.pos;
+        return true;
+    }
 
-                // 시각화를 위한 컬러 (x,y,z 축에 따른 RGB)
-                node.color = glm::vec4(x / (float)width,
-                                       y / (float)height,
-                                       z / (float)depth,
-                                       1.0f);
+    return false;
+}
 
-                // 노멀 계산 (구체이므로 중심에서 바깥으로 향하는 방향)
-                node.normal = glm::vec4(glm::normalize(glm::vec3(sx, sy, sz)), 0.0f);
+bool parseNodeFile(const std::string& filename, std::vector<Particle>& outParticles, int& outStartIndex) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open NODE file: " << filename << std::endl;
+        return false;
+    }
 
-                // 고정점 설정 (예: 젤리가 공중에 매달려 있게 하려면 특정 층을 고정)
-                //node.isFixed = (y == height - 1) ? 1.0f : 0.0f; // 필요시 특정 조건 추가
-                //node.isFixed = (y == 15 && x == 7 && z == 7) ? 1.0f : 0.0f;
-                node.isFixed = (y == 15 &&
-                                2 < x && x < 13 &&
-                                2 < z && z < 13) ? 1.0f : 0.0f;
-                nodes.push_back(node);
+    std::string line;
+    if (!getValidLine(file, line)) return false;
+
+    // 헤더 파싱: [점의 개수] [차원] [속성 개수] [경계 마커 개수]
+    int numPoints, dim, numAttributes, numBoundaryMarkers;
+    std::istringstream headerSS(line);
+    headerSS >> numPoints >> dim >> numAttributes >> numBoundaryMarkers;
+
+    outParticles.reserve(numPoints);
+    bool isFirstNode = true;
+
+    for (int i = 0; i < numPoints; ++i) {
+        if (!getValidLine(file, line)) break;
+        std::istringstream iss(line);
+
+        int index;
+        Particle p;
+        p.invMass = float(numPoints); // 기본 역질량 설정
+        p.isFixed = 0.0f;
+        p.isSurface = 0.0f;
+
+        iss >> index >> p.pos.x >> p.pos.y >> p.pos.z;
+
+        p.color = glm::vec4(p.pos.x, p.pos.y, p.pos.z, 1.0f);
+        p.vel = glm::vec4(0.0f);
+        p.originPos = p.pos;
+        p.prevPos = p.pos;
+
+        // 첫 번째 정점의 인덱스가 0인지 1인지 기록 (ele 파일 파싱 시 사용)
+        if (isFirstNode) {
+            outStartIndex = index;
+            isFirstNode = false;
+        }
+
+        outParticles.push_back(p);
+    }
+
+    std::cout << "Loaded " << outParticles.size() << " particles." << std::endl;
+    return true;
+}
+
+// .ele 파일 파싱
+bool parseEleFile(const std::string& filename, int startIndex, std::vector<Tetrahedron>& outTetras) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open ELE file: " << filename << std::endl;
+        return false;
+    }
+
+    std::string line;
+    if (!getValidLine(file, line)) return false;
+
+    // 헤더 파싱: [사면체 개수] [정점 개수(보통 4)] [속성 개수]
+    int numTetras, nodesPerTetra, numAttributes;
+    std::istringstream headerSS(line);
+    headerSS >> numTetras >> nodesPerTetra >> numAttributes;
+
+    if (nodesPerTetra != 4) {
+        std::cerr << "Error: Not a tetrahedral mesh (nodes per element != 4)" << std::endl;
+        return false;
+    }
+
+    outTetras.reserve(numTetras);
+
+    for (int i = 0; i < numTetras; ++i) {
+        if (!getValidLine(file, line)) break;
+        std::istringstream ss(line);
+
+        int index;
+        Tetrahedron tet;
+
+        ss >> index >> tet.indices[0] >> tet.indices[1] >> tet.indices[2] >> tet.indices[3];
+
+        // 0-based 인덱싱으로 정규화 (Vulkan 배열 접근을 위해)
+        for (int j = 0; j < 4; ++j) {
+            tet.indices[j] -= startIndex;
+        }
+
+        outTetras.push_back(tet);
+    }
+
+    std::cout << "Loaded " << outTetras.size() << " tetrahedra." << std::endl;
+    return true;
+}
+
+// .edge 파일 파싱
+bool parseEdgeFile(const std::string& filename, int startIndex, std::vector<Edge>& outEdges) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open EDGE file: " << filename << std::endl;
+        return false;
+    }
+
+    std::string line;
+    if (!getValidLine(file, line)) return false;
+
+    // 헤더 파싱: [사면체 개수] [정점 개수(보통 4)] [속성 개수]
+    int numEdges, boundaryMarker;
+    std::istringstream headerSS(line);
+    headerSS >> numEdges >> boundaryMarker;
+
+    outEdges.reserve(numEdges);
+
+    for (int i = 0; i < numEdges; ++i) {
+        if (!getValidLine(file, line)) break;
+        std::istringstream ss(line);
+
+        int index;
+        Edge edge;
+
+        ss >> index >> edge.indices[0] >> edge.indices[1] >> edge.marker;
+
+        // 0-based 인덱싱으로 정규화 (Vulkan 배열 접근을 위해)
+        for (int j = 0; j < 2; ++j) {
+            edge.indices[j] -= startIndex;
+        }
+
+        outEdges.push_back(edge);
+    }
+
+    std::cout << "Loaded " << outEdges.size() << " edges." << std::endl;
+    return true;
+}
+
+bool parseFaceFile(const std::string& filename, int startIndex, std::vector<Face>& outFaces) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open FACE file: " << filename << std::endl;
+        return false;
+    }
+
+    std::string line;
+    if (!getValidLine(file, line)) return false;
+
+    // 헤더 파싱: [사면체 개수] [정점 개수(보통 4)] [속성 개수]
+    int numEdges, boundaryMarker;
+    std::istringstream headerSS(line);
+    headerSS >> numEdges >> boundaryMarker;
+
+    outFaces.reserve(numEdges);
+
+    for (int i = 0; i < numEdges; ++i) {
+        if (!getValidLine(file, line)) break;
+        std::istringstream ss(line);
+
+        int index;
+        Face face;
+
+        ss >> index >> face.indices[0] >> face.indices[1] >> face.indices[2] >> face.marker;
+
+        // 0-based 인덱싱으로 정규화 (Vulkan 배열 접근을 위해)
+        for (int j = 0; j < 3; ++j) {
+            face.indices[j] -= startIndex;
+        }
+
+        outFaces.push_back(face);
+    }
+
+    std::cout << "Loaded " << outFaces.size() << " faces." << std::endl;
+    return true;
+}
+
+bool generateDistanceConstraints(const std::vector<Particle>& particles, const std::vector<Edge>& edges, const float& stiffness, std::vector<DistanceConstraint>& outConstraints) {
+    for (const auto& edge : edges) {
+        DistanceConstraint dc{};
+        dc.p1 = edge.indices[0];
+        dc.p2 = edge.indices[1];
+        dc.restLen = glm::length(glm::vec3(particles[dc.p1].pos - particles[dc.p2].pos));
+        dc.compliance = dc.restLen / stiffness;
+        dc.lambda = 0.0f;
+        outConstraints.push_back(dc);
+    }
+    return true;
+}
+
+bool generateVolumeConstraints(const std::vector<Particle>& particles, const std::vector<Tetrahedron>& tetras, const float& stiffness, std::vector<VolumeConstraint>& outConstraints) {
+    for (const auto& tetra : tetras) {
+        VolumeConstraint vc{};
+        vc.p1 = tetra.indices[0];
+        vc.p2 = tetra.indices[1];
+        vc.p3 = tetra.indices[2];
+        vc.p4 = tetra.indices[3];
+        vc.restVol = glm::dot(glm::cross(glm::vec3(particles[vc.p2].pos - particles[vc.p1].pos),
+            glm::vec3(particles[vc.p3].pos - particles[vc.p1].pos)),
+            glm::vec3(particles[vc.p4].pos - particles[vc.p1].pos)) / 6.0f;
+        vc.compliance = vc.restVol / stiffness;
+        vc.lambda = 0.0f;
+        outConstraints.push_back(vc);
+    }
+    return true;
+}
+
+struct ColorGroup {
+    uint32_t offset;
+    uint32_t count;
+};
+
+struct ColoredDistanceResult {
+    std::vector<DistanceConstraint> reorderedConstraints;
+    std::vector<ColorGroup> groups;
+};
+
+struct ColoredVolumeResult {
+    std::vector<VolumeConstraint> reorderedConstraints;
+    std::vector<ColorGroup> groups;
+};
+
+// 1. 거리 제약 조건 컬러링
+ColoredDistanceResult colorDistanceConstraints(const std::vector<DistanceConstraint>& constraints, uint32_t numParticles) {
+    std::vector<std::vector<DistanceConstraint>> colorGroups;
+    std::vector<std::vector<bool>> particleUsed;
+
+    for (const auto& c : constraints) {
+        int color = 0;
+        while (true) {
+            // 새로운 색상이 필요하면 추가
+            if (color == colorGroups.size()) {
+                colorGroups.push_back(std::vector<DistanceConstraint>());
+                particleUsed.push_back(std::vector<bool>(numParticles, false));
             }
+
+            // 현재 색상 그룹에서 해당 정점들이 이미 사용 중인지 확인
+            if (!particleUsed[color][c.p1] && !particleUsed[color][c.p2]) {
+                colorGroups[color].push_back(c);
+                particleUsed[color][c.p1] = true;
+                particleUsed[color][c.p2] = true;
+                break; // 색상을 찾았으므로 다음 제약 조건으로 넘어감
+            }
+            color++;
         }
     }
-    return nodes;
+
+    ColoredDistanceResult result;
+    uint32_t currentOffset = 0;
+    for (const auto& group : colorGroups) {
+        ColorGroup cg;
+        cg.offset = currentOffset;
+        cg.count = static_cast<uint32_t>(group.size());
+        result.groups.push_back(cg);
+
+        result.reorderedConstraints.insert(result.reorderedConstraints.end(), group.begin(), group.end());
+        currentOffset += cg.count;
+    }
+    return result;
 }
 
-static std::vector<uint32_t> generateSphereIndices(uint32_t width, uint32_t height, uint32_t depth) {
-    std::vector<uint32_t> indices;
+// 2. 부피 제약 조건 컬러링
+ColoredVolumeResult colorVolumeConstraints(const std::vector<VolumeConstraint>& constraints, uint32_t numParticles) {
+    std::vector<std::vector<VolumeConstraint>> colorGroups;
+    std::vector<std::vector<bool>> particleUsed;
 
-    // 3D 좌표를 1D 인덱스로 변환하는 헬퍼 함수
-    auto getIdx = [&](uint32_t x, uint32_t y, uint32_t z) {
-        return (z * width * height) + (y * width) + x;
-        };
+    for (const auto& c : constraints) {
+        int color = 0;
+        while (true) {
+            if (color == colorGroups.size()) {
+                colorGroups.push_back(std::vector<VolumeConstraint>());
+                particleUsed.push_back(std::vector<bool>(numParticles, false));
+            }
 
-    // 사각형 하나(4개 점)를 두 개의 삼각형으로 인덱싱하는 헬퍼 함수
-    // winding order: 시계 반대 방향(CCW)
-    auto addQuad = [&](uint32_t p0, uint32_t p1, uint32_t p2, uint32_t p3) {
-        indices.push_back(p0);
-        indices.push_back(p1);
-        indices.push_back(p2);
-
-        indices.push_back(p0);
-        indices.push_back(p2);
-        indices.push_back(p3);
-        };
-
-    // 1. 앞면 (z = 0) & 뒷면 (z = depth - 1)
-    for (uint32_t y = 0; y < height - 1; y++) {
-        for (uint32_t x = 0; x < width - 1; x++) {
-            // 앞면
-            addQuad(getIdx(x, y, 0), getIdx(x, y + 1, 0), getIdx(x + 1, y + 1, 0), getIdx(x + 1, y, 0));
-            // 뒷면
-            addQuad(getIdx(x + 1, y, depth - 1), getIdx(x + 1, y + 1, depth - 1), getIdx(x, y + 1, depth - 1), getIdx(x, y, depth - 1));
+            if (!particleUsed[color][c.p1] && !particleUsed[color][c.p2] &&
+                !particleUsed[color][c.p3] && !particleUsed[color][c.p4]) {
+                colorGroups[color].push_back(c);
+                particleUsed[color][c.p1] = true;
+                particleUsed[color][c.p2] = true;
+                particleUsed[color][c.p3] = true;
+                particleUsed[color][c.p4] = true;
+                break;
+            }
+            color++;
         }
     }
 
-    // 2. 왼쪽면 (x = 0) & 오른쪽면 (x = width - 1)
-    for (uint32_t z = 0; z < depth - 1; z++) {
-        for (uint32_t y = 0; y < height - 1; y++) {
-            // 왼쪽면
-            addQuad(getIdx(0, y, z), getIdx(0, y, z + 1), getIdx(0, y + 1, z + 1), getIdx(0, y + 1, z));
-            // 오른쪽면
-            addQuad(getIdx(width - 1, y + 1, z), getIdx(width - 1, y + 1, z + 1), getIdx(width - 1, y, z + 1), getIdx(width - 1, y, z));
-        }
-    }
+    ColoredVolumeResult result;
+    uint32_t currentOffset = 0;
+    for (const auto& group : colorGroups) {
+        ColorGroup cg;
+        cg.offset = currentOffset;
+        cg.count = static_cast<uint32_t>(group.size());
+        result.groups.push_back(cg);
 
-    // 3. 아랫면 (y = 0) & 윗면 (y = height - 1)
-    for (uint32_t z = 0; z < depth - 1; z++) {
-        for (uint32_t x = 0; x < width - 1; x++) {
-            // 아랫면
-            addQuad(getIdx(x + 1, 0, z), getIdx(x + 1, 0, z + 1), getIdx(x, 0, z + 1), getIdx(x, 0, z));
-            // 윗면
-            addQuad(getIdx(x, height - 1, z), getIdx(x, height - 1, z + 1), getIdx(x + 1, height - 1, z + 1), getIdx(x + 1, height - 1, z));
-        }
+        result.reorderedConstraints.insert(result.reorderedConstraints.end(), group.begin(), group.end());
+        currentOffset += cg.count;
     }
-
-    return indices;
+    return result;
 }
 
-const std::vector<SphereNode> nodes = generateSphereNodes(16, 16, 16, 0.1f);
-const std::vector<uint32_t> indices = generateSphereIndices(16, 16, 16);
 
 class HelloTriangleApplication {
 public:
@@ -274,14 +497,18 @@ private:
     std::vector<VkFramebuffer> swapChainFramebuffers;
 
     //depthImage, depthImageMemory;
-	VkImage depthImage;
+    VkImage depthImage;
     VkDeviceMemory depthImageMemory;
     VkImageView depthImageView;
 
     VkRenderPass renderPass;
     VkDescriptorSetLayout computeDescriptorSetLayout;
     VkPipelineLayout computePipelineLayout;
-    VkPipeline computePipeline;
+    //VkPipeline computePipeline;
+    VkPipeline predictPipeline;
+    VkPipeline solveDistPipeline;
+    VkPipeline solveVolPipeline;
+    VkPipeline updatePipeline;
 
     VkDescriptorSetLayout descriptorSetLayout;
     VkPipelineLayout pipelineLayout;
@@ -289,10 +516,33 @@ private:
 
     VkCommandPool commandPool;
 
+    std::vector<Particle> particles;
+    std::vector<Tetrahedron> tetras;
+    std::vector<Edge> edges;
+    std::vector<Face> faces;
+
+    std::vector<uint32_t> indices;
+
+    std::vector<VolumeConstraint> volumeConstraints;
+    std::vector<DistanceConstraint> distanceConstraints;
+
+    std::vector<ColorGroup> distanceColorGroups;
+    std::vector<ColorGroup> volumeColorGroups;
+
     std::vector<VkBuffer> shaderStorageBuffers;
     std::vector<VkDeviceMemory> shaderStorageBuffersMemory;
     VkBuffer indexBuffer;
     VkDeviceMemory indexBufferMemory;
+    VkBuffer tetraBuffer;
+    VkDeviceMemory tetraBufferMemory;
+    VkBuffer edgeBuffer;
+    VkDeviceMemory edgeBufferMemory;
+    VkBuffer faceBuffer;
+    VkDeviceMemory faceBufferMemory;
+    VkBuffer volumeConstraintsBuffer;
+    VkDeviceMemory volumeConstraintsBufferMemory;
+    VkBuffer distanceConstraintsBuffer;
+    VkDeviceMemory distanceConstraintsBufferMemory;
 
     std::vector<VkBuffer> uniformBuffers;
     std::vector<VkDeviceMemory> uniformBuffersMemory;
@@ -309,7 +559,52 @@ private:
     std::vector<VkFence> inFlightFences;
     uint32_t currentFrame = 0;
 
+    const float stiffness = 1024.0f;
+
     bool framebufferResized = false;
+
+    void loadMesh(const std::string& nodeFile, const std::string& eleFile, const std::string& edgeFile, const std::string& faceFile) {
+        int startIndex;
+        if (!parseNodeFile(nodeFile, particles, startIndex)) {
+            throw std::runtime_error("Failed to load node file!");
+        }
+        if (!parseEleFile(eleFile, startIndex, tetras)) {
+            throw std::runtime_error("Failed to load ele file!");
+        }
+        if (!parseEdgeFile(edgeFile, startIndex, edges)) {
+            throw std::runtime_error("Failed to load edge file!");
+        }
+        if (!parseFaceFile(faceFile, startIndex, faces)) {
+            throw std::runtime_error("Failed to load face file!");
+        }
+        indices.clear();
+        indices.reserve(faces.size() * 3);
+        for (const auto& face : faces) {
+            indices.push_back(face.indices[0]);
+            indices.push_back(face.indices[1]);
+            indices.push_back(face.indices[2]);
+        }
+    }
+
+    void createConstraints() {
+        if (!generateDistanceConstraints(particles, edges, stiffness, distanceConstraints)) {
+            throw std::runtime_error("Failed to generate distance constraints!");
+        }
+        if (!generateVolumeConstraints(particles, tetras, stiffness, volumeConstraints)) {
+            throw std::runtime_error("Failed to generate volume constraints!");
+        }
+
+        auto distResult = colorDistanceConstraints(distanceConstraints, particles.size());
+        distanceConstraints = distResult.reorderedConstraints;
+        distanceColorGroups = distResult.groups;
+
+        auto volResult = colorVolumeConstraints(volumeConstraints, particles.size());
+        volumeConstraints = volResult.reorderedConstraints;
+        volumeColorGroups = volResult.groups;
+
+        std::cout << "Distance Colors: " << distanceColorGroups.size()
+            << ", Volume Colors: " << volumeColorGroups.size() << std::endl;
+    }
 
     void initWindow() {
         glfwInit();
@@ -327,6 +622,12 @@ private:
     }
 
     void initVulkan() {
+        loadMesh(
+            "models/bunny_1k.1.node",
+            "models/bunny_1k.1.ele",
+            "models/bunny_1k.1.edge",
+            "models/bunny_1k.1.face");
+        createConstraints();
         createInstance();
         setupDebugMessenger();
         createSurface();
@@ -338,11 +639,14 @@ private:
         createRenderPass();
         createComputeDescriptorSetLayout();
         createDescriptorSetLayout();
-        createComputePipeline();
+        //createComputePipeline();
+        createComputePipelines();
         createGraphicsPipeline();
         createFramebuffers();
         createCommandPool();
         createShaderStorageBuffer();
+        createDistanceConstraintBuffer();
+        createVolumeConstraintBuffer();
         createIndexBuffer();
         createUniformBuffers();
         createDescriptorPool();
@@ -378,10 +682,13 @@ private:
 
         vkDestroyPipeline(device, graphicsPipeline, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-        vkDestroyPipeline(device, computePipeline, nullptr); // 컴퓨트 파이프라인 파괴 추가
+        vkDestroyPipeline(device, predictPipeline, nullptr);
+        vkDestroyPipeline(device, solveDistPipeline, nullptr);
+        vkDestroyPipeline(device, solveVolPipeline, nullptr);
+        vkDestroyPipeline(device, updatePipeline, nullptr);
         vkDestroyPipelineLayout(device, computePipelineLayout, nullptr);
         vkDestroyRenderPass(device, renderPass, nullptr);
-        
+
         vkDestroyImageView(device, depthImageView, nullptr);
         vkDestroyImage(device, depthImage, nullptr);
         vkFreeMemory(device, depthImageMemory, nullptr);
@@ -395,6 +702,10 @@ private:
 
         vkDestroyBuffer(device, indexBuffer, nullptr);
         vkFreeMemory(device, indexBufferMemory, nullptr);
+        vkDestroyBuffer(device, distanceConstraintsBuffer, nullptr);
+        vkFreeMemory(device, distanceConstraintsBufferMemory, nullptr);
+        vkDestroyBuffer(device, volumeConstraintsBuffer, nullptr);
+        vkFreeMemory(device, volumeConstraintsBufferMemory, nullptr);
 
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
         vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
@@ -783,8 +1094,8 @@ private:
             throw std::runtime_error("failed to create descriptor set layout!");
         }
     }
-    void createComputePipeline() {
-        auto computeShaderCode = readFile("shaders/comp.spv"); // 컴파일된 스피어브이 파일
+    /*void createComputePipeline() {
+        auto computeShaderCode = readFile("shaders/ComputeShader.comp.spv"); // 컴파일된 스피어브이 파일
         VkShaderModule computeShaderModule = createShaderModule(computeShaderCode);
 
         VkPipelineShaderStageCreateInfo shaderStageInfo{};
@@ -797,7 +1108,7 @@ private:
         VkPushConstantRange pushConstantRange{};
         pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         pushConstantRange.offset = 0;
-        pushConstantRange.size = sizeof(float) * 2;
+        pushConstantRange.size = sizeof(MeshPushConstants);
 
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
         pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -816,10 +1127,56 @@ private:
         vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &computePipeline);
 
         vkDestroyShaderModule(device, computeShaderModule, nullptr);
+    }*/
+
+    void createComputePipelines() {
+        // 1. 파이프라인 레이아웃 생성 (3개 파이프라인이 공유)
+        VkPushConstantRange pushConstantRange{};
+        pushConstantRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pushConstantRange.offset = 0;
+        pushConstantRange.size = sizeof(MeshPushConstants);
+
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+        pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipelineLayoutInfo.setLayoutCount = 1;
+        pipelineLayoutInfo.pSetLayouts = &computeDescriptorSetLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 1;
+        pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
+
+        vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &computePipelineLayout);
+
+        // 2. 개별 파이프라인 생성 헬퍼 함수
+        auto createPipeline = [&](const std::string& shaderPath, VkPipeline& pipeline) {
+            auto shaderCode = readFile(shaderPath);
+            VkShaderModule shaderModule = createShaderModule(shaderCode);
+
+            VkPipelineShaderStageCreateInfo stageInfo{};
+            stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            stageInfo.module = shaderModule;
+            stageInfo.pName = "main";
+
+            VkComputePipelineCreateInfo pipelineInfo{};
+            pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            pipelineInfo.layout = computePipelineLayout;
+            pipelineInfo.stage = stageInfo;
+
+            if (vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipeline) != VK_SUCCESS) {
+                throw std::runtime_error("failed to create compute pipeline: " + shaderPath);
+            }
+            vkDestroyShaderModule(device, shaderModule, nullptr);
+            };
+
+        // 3. 실제 파이프라인 생성 호출
+        createPipeline("shaders/Predict.comp.spv", predictPipeline); // 
+        createPipeline("shaders/SolveDist.comp.spv", solveDistPipeline); //
+        createPipeline("shaders/SolveVol.comp.spv", solveVolPipeline);     // 
+        createPipeline("shaders/Update.comp.spv", updatePipeline);   // 
     }
+
     void createGraphicsPipeline() {
-        auto vertShaderCode = readFile("shaders/vert.spv");
-        auto fragShaderCode = readFile("shaders/frag.spv");
+        auto vertShaderCode = readFile("shaders/VertexShader.vert.spv");
+        auto fragShaderCode = readFile("shaders/FragmentShader.frag.spv");
 
         VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
         VkShaderModule fragShaderModule = createShaderModule(fragShaderCode);
@@ -841,8 +1198,8 @@ private:
         VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
         vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
 
-        auto bindingDescription = SphereNode::getBindingDescription();
-        auto attributeDescriptions = SphereNode::getAttributeDescriptions();
+        auto bindingDescription = Particle::getBindingDescription();
+        auto attributeDescriptions = Particle::getAttributeDescriptions();
 
         vertexInputInfo.vertexBindingDescriptionCount = 1;
         vertexInputInfo.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size());
@@ -865,9 +1222,8 @@ private:
         rasterizer.rasterizerDiscardEnable = VK_FALSE;
         rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
         rasterizer.lineWidth = 1.0f;
-        //rasterizer.cullMode = VK_CULL_MODE_NONE;
         rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
         rasterizer.depthBiasEnable = VK_FALSE;
 
         VkPipelineDepthStencilStateCreateInfo depthStencil{};
@@ -979,10 +1335,7 @@ private:
     }
 
     void createShaderStorageBuffer() {
-        VkDeviceSize PARTICLE_COUNT = nodes.size();
-        std::vector<SphereNode> clothNodes(PARTICLE_COUNT);
-
-        VkDeviceSize bufferSize = sizeof(SphereNode) * clothNodes.size();
+        VkDeviceSize bufferSize = sizeof(Particle) * particles.size();
 
         VkBuffer stagingBuffer;
         VkDeviceMemory stagingBufferMemory;
@@ -996,7 +1349,7 @@ private:
 
         void* data;
         vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
-        memcpy(data, nodes.data(), (size_t)bufferSize);
+        memcpy(data, particles.data(), (size_t)bufferSize);
         vkUnmapMemory(device, stagingBufferMemory);
 
         shaderStorageBuffers.resize(MAX_FRAMES_IN_FLIGHT);
@@ -1016,8 +1369,75 @@ private:
         vkFreeMemory(device, stagingBufferMemory, nullptr);
     }
 
+    void createDistanceConstraintBuffer() {
+        VkDeviceSize CONSTRAINT_COUNT = distanceConstraints.size();
+        std::vector<DistanceConstraint> constraints(CONSTRAINT_COUNT);
+
+        VkDeviceSize bufferSize = sizeof(DistanceConstraint) * constraints.size();
+
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(
+            bufferSize,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            stagingBuffer,
+            stagingBufferMemory
+        );
+
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+        memcpy(data, distanceConstraints.data(), (size_t)bufferSize);
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        createBuffer(
+            bufferSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            distanceConstraintsBuffer,
+            distanceConstraintsBufferMemory
+        );
+        copyBuffer(stagingBuffer, distanceConstraintsBuffer, bufferSize);
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
+    void createVolumeConstraintBuffer() {
+        VkDeviceSize CONSTRAINT_COUNT = volumeConstraints.size();
+        std::vector<VolumeConstraint> constraints(CONSTRAINT_COUNT);
+
+        VkDeviceSize bufferSize = sizeof(VolumeConstraint) * constraints.size();
+
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(
+            bufferSize,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            stagingBuffer,
+            stagingBufferMemory
+        );
+
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+        memcpy(data, volumeConstraints.data(), (size_t)bufferSize);
+        vkUnmapMemory(device, stagingBufferMemory);
+
+
+        createBuffer(
+            bufferSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            volumeConstraintsBuffer,
+            volumeConstraintsBufferMemory
+        );
+        copyBuffer(stagingBuffer, volumeConstraintsBuffer, bufferSize);
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
     void createIndexBuffer() {
-        VkDeviceSize bufferSize = sizeof(indices[0]) * indices.size();
+        VkDeviceSize bufferSize = sizeof(uint32_t) * indices.size();
 
         VkBuffer stagingBuffer;
         VkDeviceMemory stagingBufferMemory;
@@ -1056,7 +1476,7 @@ private:
         poolSizes[0].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSizes[1].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT) * 2;
+        poolSizes[1].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT) * 4;
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1102,19 +1522,30 @@ private:
         }
     }
     void createComputeDescriptorSetLayout() {
-        std::array<VkDescriptorSetLayoutBinding, 2> layoutBindings{};
+        std::array<VkDescriptorSetLayoutBinding, 4> layoutBindings{};
         layoutBindings[0].binding = 0;
         layoutBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         layoutBindings[0].descriptorCount = 1;
         layoutBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
         layoutBindings[1].binding = 1;
         layoutBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         layoutBindings[1].descriptorCount = 1;
         layoutBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+        layoutBindings[2].binding = 2;
+        layoutBindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        layoutBindings[2].descriptorCount = 1;
+        layoutBindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        layoutBindings[3].binding = 3;
+        layoutBindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        layoutBindings[3].descriptorCount = 1;
+        layoutBindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layoutInfo.bindingCount = 2;
+        layoutInfo.bindingCount = 4;
         layoutInfo.pBindings = layoutBindings.data();
 
         if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &computeDescriptorSetLayout) != VK_SUCCESS) {
@@ -1141,14 +1572,24 @@ private:
             VkDescriptorBufferInfo inBufferInfo{};
             inBufferInfo.buffer = shaderStorageBuffers[(i + 1) % MAX_FRAMES_IN_FLIGHT]; // 우리가 만든 SSBO
             inBufferInfo.offset = 0;
-            inBufferInfo.range = sizeof(SphereNode) * nodes.size();
+            inBufferInfo.range = sizeof(Particle) * particles.size();
 
             VkDescriptorBufferInfo outBufferInfo{};
             outBufferInfo.buffer = shaderStorageBuffers[i]; // 우리가 만든 SSBO
             outBufferInfo.offset = 0;
-            outBufferInfo.range = sizeof(SphereNode) * nodes.size();
+            outBufferInfo.range = sizeof(Particle) * particles.size();
 
-            std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
+            VkDescriptorBufferInfo DistanceConstraintBufferInfo{};
+            DistanceConstraintBufferInfo.buffer = distanceConstraintsBuffer;
+            DistanceConstraintBufferInfo.offset = 0;
+            DistanceConstraintBufferInfo.range = sizeof(DistanceConstraint) * distanceConstraints.size();
+
+            VkDescriptorBufferInfo VolumeConstraintBufferInfo{};
+            VolumeConstraintBufferInfo.buffer = volumeConstraintsBuffer;
+            VolumeConstraintBufferInfo.offset = 0;
+            VolumeConstraintBufferInfo.range = sizeof(VolumeConstraint) * volumeConstraints.size();
+
+            std::array<VkWriteDescriptorSet, 4> descriptorWrites{};
             descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             descriptorWrites[0].dstSet = computeDescriptorSets[i];
             descriptorWrites[0].dstBinding = 0;
@@ -1161,8 +1602,20 @@ private:
             descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             descriptorWrites[1].descriptorCount = 1;
             descriptorWrites[1].pBufferInfo = &outBufferInfo;
+            descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[2].dstSet = computeDescriptorSets[i];
+            descriptorWrites[2].dstBinding = 2;
+            descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            descriptorWrites[2].descriptorCount = 1;
+            descriptorWrites[2].pBufferInfo = &DistanceConstraintBufferInfo;
+            descriptorWrites[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[3].dstSet = computeDescriptorSets[i];
+            descriptorWrites[3].dstBinding = 3;
+            descriptorWrites[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            descriptorWrites[3].descriptorCount = 1;
+            descriptorWrites[3].pBufferInfo = &VolumeConstraintBufferInfo;
 
-            vkUpdateDescriptorSets(device, 2, descriptorWrites.data(), 0, nullptr);
+            vkUpdateDescriptorSets(device, 4, descriptorWrites.data(), 0, nullptr);
         }
     }
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
@@ -1258,18 +1711,66 @@ private:
         if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
             throw std::runtime_error("failed to begin recording command buffer!");
         }
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout,
-            0, 1, &computeDescriptorSets[currentFrame], 0, nullptr);
+        //vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline);
+        //vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout,
+        //    0, 1, &computeDescriptorSets[currentFrame], 0, nullptr);
         MeshPushConstants pc{};
-        pc.dt = 0.002f;
+        pc.dt = 0.016f;
         static float time = 0.0f;
         time += pc.dt;
         pc.u_Time = time;
+        pc.subStepCnt = 16;
         //std::cout << "Time : " << pc.u_time << std::endl;
-        vkCmdPushConstants(commandBuffer, computePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MeshPushConstants), &pc);
-        vkCmdDispatch(commandBuffer, 1, 1, 16);
 
+        uint32_t readIdx = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+        uint32_t writeIdx = currentFrame;
+
+        for (int i = 0; i < pc.subStepCnt; i++) {
+
+            // Step 1. Predict
+            pc.iteration = 0;
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, predictPipeline);
+            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout,
+                0, 1, &computeDescriptorSets[writeIdx], 0, nullptr);
+            vkCmdPushConstants(commandBuffer, computePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MeshPushConstants), &pc);
+            vkCmdDispatch(commandBuffer, (particles.size() + 63) / 64, 1, 1);
+            addComputeBarrier(commandBuffer, shaderStorageBuffers[writeIdx]);
+
+            // Step 2. Solve (Iterative)
+            int constraintCount = 4;
+            for (int j = 0; j < constraintCount; j++) {
+                pc.iteration = j;
+                vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, solveDistPipeline);
+                vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout,
+                    0, 1, &computeDescriptorSets[writeIdx], 0, nullptr);
+
+                for (const auto& group : distanceColorGroups) {
+                    pc.constraintOffset = group.offset;
+                    pc.constraintCount = group.count;
+                    vkCmdPushConstants(commandBuffer, computePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MeshPushConstants), &pc);
+                    vkCmdDispatch(commandBuffer, (group.count + 63) / 64, 1, 1);
+                    addComputeBarrier(commandBuffer, shaderStorageBuffers[writeIdx]);
+                }
+
+                vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, solveVolPipeline);
+                vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout,
+                    0, 1, &computeDescriptorSets[writeIdx], 0, nullptr);
+                for (const auto& group : volumeColorGroups) {
+                    pc.constraintOffset = group.offset;
+                    pc.constraintCount = group.count;
+                    vkCmdPushConstants(commandBuffer, computePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MeshPushConstants), &pc);
+                    vkCmdDispatch(commandBuffer, (group.count + 63) / 64, 1, 1);
+                    addComputeBarrier(commandBuffer, shaderStorageBuffers[writeIdx]);
+                }
+            }
+            // Step 3. Update
+            vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, updatePipeline);
+            vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, computePipelineLayout,
+                0, 1, &computeDescriptorSets[readIdx], 0, nullptr); // Update는 readIdx를 읽고 writeIdx에 쓰는 형태이므로, readIdx로 바인딩
+            vkCmdPushConstants(commandBuffer, computePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MeshPushConstants), &pc);
+            vkCmdDispatch(commandBuffer, (particles.size() + 63) / 64, 1, 1);
+            addComputeBarrier(commandBuffer, shaderStorageBuffers[readIdx]);
+        }
 
         VkBufferMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -1277,7 +1778,7 @@ private:
         barrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT; // Vertex에서 읽음
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.buffer = shaderStorageBuffers[currentFrame];      // 우리가 만든 SSBO
+        barrier.buffer = shaderStorageBuffers[readIdx];      // 우리가 만든 SSBO
         barrier.offset = 0;
         barrier.size = VK_WHOLE_SIZE;
 
@@ -1299,7 +1800,7 @@ private:
         std::array<VkClearValue, 2> clearValues{};
         clearValues[0].color = { {0.0f, 0.0f, 0.0f, 1.0f} };
         clearValues[1].depthStencil = { 1.0f, 0 }; // 깊이 최대값(1.0)으로 초기화
-        
+
         renderPassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
         renderPassInfo.pClearValues = clearValues.data();
 
@@ -1322,7 +1823,7 @@ private:
         scissor.extent = swapChainExtent;
         vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-        VkBuffer SSBuffers[] = { shaderStorageBuffers[currentFrame] };
+        VkBuffer SSBuffers[] = { shaderStorageBuffers[readIdx] };
         VkDeviceSize offsets[] = { 0 };
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, SSBuffers, offsets);
         //VkBuffer vertexBuffers[] = { vertexBuffer };
@@ -1334,6 +1835,25 @@ private:
         if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
             throw std::runtime_error("failed to record command buffer!");
         }
+    }
+
+    void addComputeBarrier(VkCommandBuffer commandBuffer, VkBuffer buffer) {
+        VkBufferMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;       // Compute에서 씀
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT; // Vertex에서 읽음
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = buffer;      // 우리가 만든 SSBO
+        barrier.offset = 0;
+        barrier.size = VK_WHOLE_SIZE;
+
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  // 출발지: Compute 단계
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,    // 목적지: Vertex 입력 단계
+            0, 0, nullptr, 1, &barrier, 0, nullptr
+        );
     }
 
     void createSyncObjects() {
@@ -1378,7 +1898,7 @@ private:
         UniformBufferObject ubo{};
         //ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
         ubo.model = glm::mat4(1.0f);
-        ubo.view = glm::lookAt(glm::vec3(-3.0f, 2.0f, -3.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+        ubo.view = glm::lookAt(glm::vec3(4.0f, 1.0f, -4.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
         ubo.proj = glm::perspective(glm::radians(45.0f), swapChainExtent.width / (float)swapChainExtent.height, 0.1f, 10.0f);
         ubo.proj[1][1] *= -1;
 

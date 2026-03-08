@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.21)
-project(Vulkan_Spring_Sphere_Sim)
+project(Vulkan_XPBD_TetraSim)
 
 # Standard C++ version
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(SOURCES 
-    Vulkan_Spring_Sphere.cpp
+    Vulkan_XPBD_TetraSim.cpp
 )
 include(FetchContent)
 
@@ -59,13 +59,10 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 # -------------------------------------------------------------------
 # set shaders source folder and target folder
 set(SHADER_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
-set(SHADER_BINARY_DIR "$<TARGET_FILE_DIR:${PROJECT_NAME}>/shaders")
-add_custom_command(
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_BINARY_DIR}"
-)
+set(SHADER_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 
 # load shader files to compile
-file(GLOB SHADER_FILES 
+file(GLOB SHADER_FILES CONFIGURE_DEPENDS
     "${SHADER_SOURCE_DIR}/*.vert"
     "${SHADER_SOURCE_DIR}/*.frag"
     "${SHADER_SOURCE_DIR}/*.comp"
@@ -79,9 +76,11 @@ foreach(SHADER_PATH ${SHADER_FILES})
     # generate shaders output directory
     add_custom_command(
         OUTPUT "${SPIRV_PATH}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${SHADER_BINARY_DIR}"
         COMMAND ${Vulkan_GLSL_COMPILER} "${SHADER_PATH}" -o "${SPIRV_PATH}"
         DEPENDS "${SHADER_PATH}"
         COMMENT "Compiling shader: ${SHADER_NAME} -> ${SHADER_NAME}.spv"
+        VERBATIM
     )
     list(APPEND SPIRV_BINARY_FILES "${SPIRV_PATH}")
 endforeach()
@@ -91,3 +90,22 @@ add_custom_target(CompileShaders ALL DEPENDS ${SPIRV_BINARY_FILES})
 
 # set compiling shaders go before building an execution file
 add_dependencies(${PROJECT_NAME} CompileShaders)
+
+add_custom_command(
+    TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${SHADER_BINARY_DIR}"
+        "$<TARGET_FILE_DIR:${PROJECT_NAME}>/shaders"
+    COMMENT "Copying shader files to the execution folder..."
+)
+
+# -------------------------------------------------------------------
+# 6. copy models folder to exe file
+# -------------------------------------------------------------------
+add_custom_command(
+    TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/models"
+        "$<TARGET_FILE_DIR:${PROJECT_NAME}>/models"
+    COMMENT "Copying model files to the execution folder..."
+)
